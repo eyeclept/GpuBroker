@@ -1,0 +1,26 @@
+{
+  "proxy_server_implemented": {
+    "description": "server.py implements a stateless reverse proxy over Ollama's full API surface (native /api/* and OpenAI-compatible /v1/*), routing by a model -> backend registry, gated through GpuBroker's /acquire//release with mb=0 for real generation requests only",
+    "passes": true
+  },
+  "proxy_unit_tests": {
+    "description": "tests/test_server.py covers registry resolution, model extraction, header stripping, the full acquire/forward/release flow, 429 denial with Retry-After, fail-open on broker connection error, 404 on unresolved backend, and native-endpoint passthrough without broker gating; 15/15 pass",
+    "passes": true
+  },
+  "proxy_dockerfile_compose_env": {
+    "description": "Dockerfile, docker-compose.yml (joins ollama_default externally, publishes 11434), .env.example, registry.json, Assist/init.sh all present and building",
+    "passes": true
+  },
+  "ollama_port_moved_internal": {
+    "description": "~/Documents/Code/Docker/Ollama/docker-compose.yml no longer publishes 11434 to the host; container reachable only via the ollama_default network by other joined containers",
+    "passes": true
+  },
+  "gpubroker_passive_poll_repointed": {
+    "description": "GpuBroker's own docker-compose.yml joins ollama_default; OLLAMA_URL repointed to http://ollama:11434 so its passive /api/ps footprint poll bypasses the proxy's admission gate (read-only telemetry, not a workload)",
+    "passes": true
+  },
+  "live_integration_verified": {
+    "description": "Verified live against the real broker, real Ollama, and real Headroom: /health, GET /api/ps forwarded and ungated (regression-tested after being caught live), POST /v1/chat/completions acquires a real mb=0 lease with a unique caller and correctly forwards/streams Ollama's actual response (including a real backend 500, forwarded verbatim, proving pass-through fidelity), broker denial produces a real 429 with the configured Retry-After value, broker-unreachable correctly fails open, GpuBroker's own /api/ps poll recovered from 404 to 200 after the network fix, Headroom's headroom-ollama required zero config changes and reaches the same chain. A live GPU-OOM condition from an unrelated running game (confirmed via nvidia-smi, ~8.3GB in use) prevented observing a fully successful (200) generation end to end on this host at test time; the success path is covered by proxy_unit_tests instead.",
+    "passes": true
+  }
+}

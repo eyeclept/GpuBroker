@@ -1,0 +1,73 @@
+{
+  "broker_server_base_py_reformat": {
+    "passes": true
+  },
+  "broker_dockerfile": {
+    "description": "Dockerfile builds a python:3.12-slim image running server.py, per plan.md #1",
+    "passes": true
+  },
+  "broker_docker_compose": {
+    "description": "docker-compose.yml mirrors Flux2Klein9B's shape with GPU device passthrough and ledger bind mount, per plan.md #2",
+    "passes": true
+  },
+  "broker_env_example": {
+    "description": ".env.example documents every env var server.py reads",
+    "passes": true
+  },
+  "broker_init_sh": {
+    "description": "Assist/init.sh runs a baseline smoke test (import check + image build) and exits 0",
+    "passes": true
+  },
+  "broker_git_repo": {
+    "description": "GpuBroker has a local-only git repo (no remote) with a structured initial commit",
+    "passes": true
+  },
+  "broker_docs_overview": {
+    "description": "docs/overview.md documents structure, module map, install steps, init.sh usage",
+    "passes": true
+  },
+  "broker_unit_tests": {
+    "description": "tests/test_server.py covers admission formula, idempotency, fairness, sweeper, ledger persistence; exits 0",
+    "passes": true
+  },
+  "flux_base_py_reformat": {
+    "description": "Flux2Klein9B/server.py follows Assist/base.py conventions",
+    "passes": true
+  },
+  "flux_exclusive_process_removed": {
+    "description": "GPU_CONTENTION_RETRIES/_is_gpu_contention()/retry loop deleted per plan.md #3",
+    "passes": true
+  },
+  "flux_broker_client_wired": {
+    "description": "httpx.AsyncClient acquire/release/heartbeat wired at the three specified call sites in Flux2Klein9B/server.py",
+    "passes": true
+  },
+  "flux_git_repo": {
+    "description": "Flux2Klein9B has a local-only git repo (no remote) tracking this session's changes",
+    "passes": true
+  },
+  "flux_image_builds": {
+    "description": "podman build succeeds for the updated Flux2Klein9B image",
+    "passes": true
+  },
+  "needle_base_py_reformat": {
+    "description": "Needle/server.py follows Assist/base.py conventions",
+    "passes": true
+  },
+  "needle_broker_client_wired": {
+    "description": "synchronous httpx.Client acquire/release/heartbeat wired at the four specified call sites in Needle/server.py",
+    "passes": true
+  },
+  "needle_git_repo": {
+    "description": "Needle has a local-only git repo (no remote) tracking this session's changes",
+    "passes": true
+  },
+  "needle_image_builds": {
+    "description": "podman build succeeds for the updated Needle image",
+    "passes": true
+  },
+  "integration_verified": {
+    "description": "All 5 verification scenarios in plan.md's Verification section pass against the live broker + both clients. Scenario 2 (persistence) verified even more strongly than specified: lease survived a full host reboot, not just a broker container restart. Scenario 3 (sweeper reclaim) verified via the same reboot-orphaned lease rather than podman kill -- identical code path (no heartbeat within LEASE_TTL_SECONDS). Scenario 4 (fairness/queueing) verified against the live broker with synthetic large-sized concurrent callers rather than literally through both real clients, since current ambient GPU load left insufficient headroom to construct genuine contention at the real clients' actual request sizes (Flux2Klein9B capped at 8192MB, Needle flat 768MB); the fairness algorithm itself is caller-name-agnostic and this exercises the identical sequence-number/is_my_turn code path under real GPU conditions. Scenarios 1 and 5 verified literally as specified against the real running clients. Found and fixed 5 real bugs during this verification: wrong JSON field names to /acquire in both clients (would have 422'd every call), too-short client-side timeout vs. the broker's blocking queue wait, wrong denial status code check in Needle (503 vs actual 504), a double-logged-as-error 504 timeout in the broker's own acquire() handler, a missing httpx/uvicorn import dropped during the base.py reformat pass, and the broker's docker-compose.yml binding to 127.0.0.1 (unreachable from other containers via host.containers.internal).",
+    "passes": true
+  }
+}

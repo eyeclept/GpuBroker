@@ -1,0 +1,10 @@
+{
+  "backends": [
+    {
+      "name": "ollama",
+      "base_url": "http://ollama:11434",
+      "models": [],
+      "default": true
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+services:
+  gpubroker:
+    build: .
+    ports:
+      # NOT 127.0.0.1-only: this service must be reachable from
+      # Flux2Klein9B/Needle containers via host.containers.internal, which
+      # resolves to the host's bridge gateway IP, not loopback. A
+      # loopback-only bind (mirrored from Flux2Klein9B's own compose file,
+      # which is correct for that service since only the host itself calls
+      # it) makes the broker invisible to every other container on this
+      # host -- confirmed live: clients got "broker unreachable" on every
+      # acquire attempt with this bound to 127.0.0.1 only.
+      - "8792:8792"
+    env_file:
+      - .env
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    volumes:
+      - ./data:/data
+    networks:
+      # Reaches Ollama directly for its own passive /api/ps footprint poll
+      # (see server.py's _poll_ollama / OLLAMA_URL) -- this is read-only
+      # telemetry, never meant to be admission-gated, so it bypasses
+      # GpuBroker-Proxy (which now owns port 11434 on the host) rather than
+      # going through it. See GpuBroker-Proxy/docker-compose.yml for the
+      # matching external-network join on the other side.
+      - default
+      - ollama_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:8792/health', timeout=5.0).raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  ollama_default:
+    external: true
