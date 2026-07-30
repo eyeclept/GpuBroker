@@ -1,0 +1,13 @@
+This release adds a new stateless reverse proxy component called GpuBroker-Proxy. The proxy exposes an OpenAI-compatible /v1/* surface alongside Ollama's native /api/* endpoints. Traffic routes through a model-to-backend registry.
+
+The proxy acquires a broker lease per generation request (mb=0 to avoid double-counting passive VRAM telemetry). The proxy denies requests using a 429 response and a Retry-After header when the GPU reaches full capacity. The proxy fails open if the broker becomes unreachable. Responses stream through the proxy. Each response releases its lease only after a full drain.
+
+We found a routing gap while testing live traffic. Paths without a model declaration now pass straight through instead of returning 404 silently. This change covers /api/ps, /v1/models, and other paths.
+
+This implementation includes 15 unit tests. We verified it on real hardware with GpuBroker, Ollama, and Headroom running concurrently.
+
+This release adds a TI-Template folder providing copy-paste async/sync broker-client templates for future service integrations. This release adds README.md and SetupGuide.md to document the full deployment procedure in dependency order. This release adds a generic sync tool that replaces project-local scripts with history tracking, changelog generation, and git note recording.
+
+The initial sync damaged the public mirror's .gitignore file on the first test runs. This release also repairs that issue by fixing the public mirror's .gitignore file afterwards. A new data/.gitkeep file lets the empty bind-mount directory pass through to the public copy without special-casing.
+
+This verification confirms the following results from earlier testing. A lease survives a full host reboot and the sweeper reclaims it within 180s. The system queues concurrent callers correctly. Caller-a gets granted immediately while caller-b waits behind it. When the broker stops, Flux2Klein9B fails open and Needle resumes normally after a restart.

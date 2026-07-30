@@ -49,3 +49,6 @@ data/*
 
 # --- Logs ---
 logs/
+
+# --- sync_to_public.py state (never commit this) ---
+.sync_state.json
