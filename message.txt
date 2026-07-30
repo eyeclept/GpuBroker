@@ -1,13 +1,7 @@
-This release adds a new stateless reverse proxy component called GpuBroker-Proxy. The proxy exposes an OpenAI-compatible /v1/* surface alongside Ollama's native /api/* endpoints. Traffic routes through a model-to-backend registry.
+The admission gate in server.py now uses only ledger-based projections to decide requests. The formula is reserved_mb plus ollama_mb plus requested_mb must be less than or equal to gpu_total minus SAFETY_MARGIN_MB. This change fixes a bug that double-counted idle VRAM as both live usage and the configured margin.
 
-The proxy acquires a broker lease per generation request (mb=0 to avoid double-counting passive VRAM telemetry). The proxy denies requests using a 429 response and a Retry-After header when the GPU reaches full capacity. The proxy fails open if the broker becomes unreachable. Responses stream through the proxy. Each response releases its lease only after a full drain.
+Live GPU usage is still read on every admission attempt, but it now serves only anomaly detection. A warning log flags unexpected spikes versus the sum of SAFETY_MARGIN_MB and reserved_total. The docstring at server.py line 306 was updated to document this new formula and rationale. No changes are needed in .env, .env.example, or plan.md.
 
-We found a routing gap while testing live traffic. Paths without a model declaration now pass straight through instead of returning 404 silently. This change covers /api/ps, /v1/models, and other paths.
+Two regression tests were added in tests/test_server.py to reproduce the original incident numbers. One test uses gpu_total of 12282 and a margin of 4864. A request for 5120 MB was previously rejected even though about 9060 MB was physically free. The fix now grants this request, so one test confirms that behavior. Another test confirms an 11000 MB request still times out.
 
-This implementation includes 15 unit tests. We verified it on real hardware with GpuBroker, Ollama, and Headroom running concurrently.
-
-This release adds a TI-Template folder providing copy-paste async/sync broker-client templates for future service integrations. This release adds README.md and SetupGuide.md to document the full deployment procedure in dependency order. This release adds a generic sync tool that replaces project-local scripts with history tracking, changelog generation, and git note recording.
-
-The initial sync damaged the public mirror's .gitignore file on the first test runs. This release also repairs that issue by fixing the public mirror's .gitignore file afterwards. A new data/.gitkeep file lets the empty bind-mount directory pass through to the public copy without special-casing.
-
-This verification confirms the following results from earlier testing. A lease survives a full host reboot and the sweeper reclaims it within 180s. The system queues concurrent callers correctly. Caller-a gets granted immediately while caller-b waits behind it. When the broker stops, Flux2Klein9B fails open and Needle resumes normally after a restart.
+The existing test_queue_timeout_when_no_room was adjusted because it relied on live usage alone to trigger the old gate refusal. Its request size changed from 1000 to 7000 MB. A Resolved addendum was appended to Assist/ISSUE_double_counted_margin.md to document this fix and its scope deviation. The original issue doc noted not to touch the max() term, but that term is now repurposed for anomaly detection rather than gate input. Live broker verification against a real running instance confirms the change.

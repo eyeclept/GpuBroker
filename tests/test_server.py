@@ -93,8 +93,16 @@ def test_admission_formula_deny_insufficient_budget(broker_app):
         assert resp.status_code == 504
 
 
-def test_admission_formula_max_not_sum(broker_app):
-    """Test: Admission uses max(used, reserved+ollama) not sum."""
+def test_admission_ignores_live_usage_spike_when_ledger_has_room(broker_app):
+    """Test: Live nvidia-smi usage well above tracked leases does not block request if ledger fits.
+    
+    Under the new admission formula (Policy A), live usage is not part of the gate.
+    The gate is ledger-only: reserved_total + requested <= budget.
+    A high nvidia-smi reading (e.g., 8000 MB from desktop/other processes) does not
+    block a request the ledger says fits. Live usage is monitored for anomaly detection
+    only (logged as warning if it exceeds SAFETY_MARGIN + reserved_total), but never
+    blocks admission.
+    """
     from fastapi.testclient import TestClient
     
     client = TestClient(broker_app.app)
@@ -108,6 +116,72 @@ def test_admission_formula_max_not_sum(broker_app):
         
         assert resp.status_code == 200
         assert resp.json()["granted"] is True
+
+
+def test_double_counted_margin_regression_grants_physically_fitting_request(broker_app):
+    """Test: 5120 MB request that physically fits is now granted (was wrongly refused).
+    
+    Regression test for the double-counted-margin bug (Assist/ISSUE_double_counted_margin.md).
+    Exact numbers from the reported incident:
+    - gpu_total_mb=12282, safety_margin_mb=4864, budget=7418
+    - nvidia_smi shows 3222 MB in use (desktop/baseline)
+    - empty ledger (reserved=0, ollama=0)
+    - request 5120 MB (float16 whisper model)
+    
+    Under the old buggy formula: max(3222,0)+5120=8342 > 7418 -> wrongly refused (504)
+    Under the new fixed formula: 0+5120=5120 <= 7418 -> correctly granted (200)
+    
+    The fix: live usage is NOT part of the gate. Gate is ledger-only:
+    reserved_total + req <= budget_mb, where budget_mb = total - SAFETY_MARGIN_MB.
+    SAFETY_MARGIN_MB represents baseline idle usage already inside every nvidia-smi
+    reading, so we only gate against the ledger (what we explicitly reserved).
+    """
+    from fastapi.testclient import TestClient
+    
+    client = TestClient(broker_app.app)
+    
+    # Override defaults with exact bug-report numbers
+    broker_app._gpu_total_mb = 12282.0
+    broker_app._ollama_mb = 0.0
+    broker_app.SAFETY_MARGIN_MB = 4864
+    
+    # Mock nvidia-smi to return the measured live usage from the incident
+    with patch.object(broker_app, "_nvidia_smi_query", return_value=3222.0):
+        resp = client.post("/acquire", json={
+            "caller": "whisper_regression",
+            "mb": 5120.0,
+            "timeout_s": 5.0,
+        })
+        
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.json()}"
+        assert resp.json()["granted"] is True
+
+
+def test_double_counted_margin_regression_still_denies_oversized_request(broker_app):
+    """Test: A genuinely oversized request is still denied (fix not 'grant everything').
+    
+    Same setup as the regression grant test, but request 9000 MB which does NOT
+    physically fit: reserved_total(0) + 9000 = 9000 > budget(7418), so it must be
+    refused. This proves the fix did not accidentally become 'always grant'.
+    """
+    from fastapi.testclient import TestClient
+    
+    client = TestClient(broker_app.app)
+    
+    # Override defaults with exact bug-report numbers
+    broker_app._gpu_total_mb = 12282.0
+    broker_app._ollama_mb = 0.0
+    broker_app.SAFETY_MARGIN_MB = 4864
+    
+    # Mock nvidia-smi to return the measured live usage from the incident
+    with patch.object(broker_app, "_nvidia_smi_query", return_value=3222.0):
+        resp = client.post("/acquire", json={
+            "caller": "oversized_request",
+            "mb": 9000.0,
+            "timeout_s": 1.0,  # Short timeout so we don't hang on polling
+        })
+        
+        assert resp.status_code == 504, f"Expected 504, got {resp.status_code}: {resp.json()}"
 
 
 # Tests: Idempotent Acquire
@@ -143,15 +217,22 @@ def test_acquire_idempotent_dedup_by_caller(broker_app):
 # Tests: Queueing and Timeout
 
 def test_queue_timeout_when_no_room(broker_app):
-    """Test: Acquire times out when there's insufficient room."""
+    """Test: Acquire times out when there's insufficient room in the ledger budget."""
     from fastapi.testclient import TestClient
     
     client = TestClient(broker_app.app)
     
-    with patch.object(broker_app, "_nvidia_smi_query", return_value=10000.0):
+    # With new formula, gate is ledger-only: reserved_total + req <= budget_mb
+    # Default: _gpu_total_mb=12288, SAFETY_MARGIN_MB=1536, _ollama_mb=4096
+    # Budget = 12288 - 1536 = 10752
+    # Reserved = 4096
+    # Available = 10752 - 4096 = 6656
+    # Request 7000 MB > available 6656 MB -> should timeout/504
+    
+    with patch.object(broker_app, "_nvidia_smi_query", return_value=2048.0):
         resp = client.post("/acquire", json={
             "caller": "test_timeout",
-            "mb": 1000.0,
+            "mb": 7000.0,
             "timeout_s": 1.0,
         })
         

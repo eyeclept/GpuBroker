@@ -304,7 +304,17 @@ async def acquire(req: AcquireRequest):
     Output:     dict - {"granted": True, "lease_id": str} or raises HTTPException(504)
     Details:
         POST /acquire endpoint. Implements admission formula:
-        max(nvidia_smi_used_mb, reserved_mb + ollama_mb) + requested_mb <= budget_mb.
+        reserved_mb + ollama_mb + requested_mb <= budget_mb, where budget_mb =
+        gpu_total_mb - SAFETY_MARGIN_MB. SAFETY_MARGIN_MB measures baseline
+        idle GPU usage (desktop compositor, driver reserve, stray usage --
+        see .env.example), which is exactly what nvidia-smi reports with an
+        empty ledger. Live usage is therefore not added to the gate: doing so
+        charged that same baseline twice, once via the margin and once via
+        the live reading, and refused requests that physically fit (see
+        Assist/ISSUE_double_counted_margin.md). Live nvidia-smi usage is
+        still read and compared against margin + reserved, purely to log a
+        warning when something is consuming VRAM the ledger doesn't know
+        about; it never gates admission.
         Deduplicates by caller name (one load per caller). Enforces fairness via
         monotonic sequence numbers on pending requests (minimum waits). Polls with
         exponential backoff (1s→10s) until timeout or granted. Persists ledger on
@@ -331,9 +341,17 @@ async def acquire(req: AcquireRequest):
             async with _lock:
                 is_my_turn = not _pending or seq == min(_pending)
                 if is_my_turn:
+                    reserved_total = _reserved_mb() + _ollama_mb
                     used_mb = await _live_used_mb()
-                    projected = max(used_mb, _reserved_mb() + _ollama_mb)
-                    if projected + req.mb <= budget_mb:
+                    expected_mb = SAFETY_MARGIN_MB + reserved_total
+                    if used_mb > expected_mb:
+                        logger.warning(
+                            "live nvidia-smi usage (%.0f MB) exceeds baseline + tracked "
+                            "leases (%.0f MB = %.0f MB margin + %.0f MB reserved); "
+                            "something is consuming VRAM the ledger doesn't know about",
+                            used_mb, expected_mb, SAFETY_MARGIN_MB, reserved_total,
+                        )
+                    if reserved_total + req.mb <= budget_mb:
                         lease_id = str(uuid.uuid4())
                         now = time.monotonic()
                         _leases[lease_id] = {
