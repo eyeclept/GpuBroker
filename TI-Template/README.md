@@ -1,179 +1,197 @@
 # TI-Template: Tightly-Integrated GPU Service Broker Client
 
-## What is a Tightly-Integrated (TI) GPU Service?
+## What is a tightly-integrated GPU service
 
-A tightly-integrated GPU service coordinates its own GPU load and evict lifecycle with GpuBroker's VRAM lease API. This differs from a passive backend service, which the broker only observes without direct coordination.
+A tightly-integrated GPU service coordinates its load and evict cycle with the GpuBroker VRAM lease API. A passive backend does not call the broker. The broker only observes that backend.
 
-Passive backends expose an API but do not call the broker. The broker queries them to check their current VRAM use. Active services call the broker to announce when they load models onto GPU and when they free that memory.
+An active service calls the broker when it loads a model onto the GPU and when it frees that memory. The three calls are acquire, release, and heartbeat. That sequence stops two services from loading models that together exceed free VRAM.
 
-A tightly-integrated service uses acquire, release, and heartbeat calls around its own load and evict operations. This coordination prevents two services from loading models that together exceed available VRAM.
+## Lease state
 
-## The Acquire-Release-Heartbeat Contract
+The caller stores `lease_id`. Pass that value into `_broker_release` and `_broker_heartbeat`. The modules keep no module-level lease global.
 
-Three operations coordinate GPU resource use:
+The async and sync files share names and behavior. They differ only in I/O. The async file uses `httpx.AsyncClient` and `asyncio.sleep`. The sync file uses `httpx.Client` and `time.sleep`.
 
-**Acquire** requests VRAM before loading a model onto GPU. The broker allocates VRAM from the pool and issues a lease ID. If the broker has insufficient free VRAM, it queues the request and waits for room to open up. The acquire call blocks until the broker either grants the lease or times out (configurable timeout on the broker side, default 300 seconds).
+## Acquire, release, and heartbeat
 
-**Release** returns VRAM after the model is removed from GPU. Call this function only after GPU memory is freed (for example, after `torch.cuda.empty_cache()` or equivalent). Do not call release merely when eviction is decided.
+**Acquire** asks for VRAM before any load. The broker grants a lease id or refuses. This template sends `timeout_s` of 30 seconds. The broker blocks up to that time.
 
-**Heartbeat** keeps a lease alive during active use. Call heartbeat periodically on a background tick (for example, every 20 to 30 seconds) only when a lease is held. The broker expires leases that miss heartbeats for longer than the broker's lease TTL (default 180 seconds).
+A 200 returns `AcquireResult(lease_id, warning)`. If the response includes `warning`, the client logs it at WARNING. That field is a one-shot watchdog notice from a previous reclaim.
 
-## Integration Checklist
+**Release** returns VRAM after the model is off the GPU. Call it after the free, for example after `torch.cuda.empty_cache()`. Do not call it when you only decide to evict.
 
-### Step 1: Choose Your Client
+**Heartbeat** keeps a live lease alive. Call it on a background tick every 20 to 30 seconds while you hold a lease. The broker sweeper reclaims a lease that misses heartbeats for longer than the lease TTL (default 180 seconds). The default preemption grace is 30 seconds.
 
-Two templates exist: `async_broker_client.py` for async request handlers and `sync_broker_client.py` for synchronous request handlers.
+`_broker_heartbeat` returns `HeartbeatResult(ok, preempt, reason)`:
 
-Use `async_broker_client.py` if your service already processes requests asynchronously. Use `sync_broker_client.py` if your service already blocks synchronously during request handling. Do not mix a sync client into an otherwise async request path.
+| `ok` | `preempt` | Meaning | Action |
+|---|---|---|---|
+| `True` | `False` | Lease is alive | Keep the model loaded |
+| `True` | `True` | Broker wants this lease gone | Unload, then release, before the 30 s grace ends |
+| `False` | any | Lease is gone | Re-acquire before any GPU use |
+| `None` | any | Transport error | Retry on the next tick. Do not treat the lease as lost |
 
-### Step 2: Adapt the Template
+## Integration checklist
 
-Copy the chosen template into your service repository as `broker_client.py` or similar. Edit the top of the file:
+### Step 1: Choose the client
 
-- Replace `"REPLACE_ME"` in the `CALLER_NAME` constant with a unique name for your service (for example, `"my-inference-service"`). This name must be unique across all services using this broker instance. Use a fixed string if your service has exactly one concurrent load slot, matching the existing examples.
-- Set `BROKER_URL` in your `.env` file to point to the broker (default `http://host.containers.internal:8792` works when the broker runs as a container).
-- Decide whether `BROKER_FAIL_OPEN` should be `true` or `false` for your specific service (see below).
+Copy `async_broker_client.py` if your request path is async. Copy `sync_broker_client.py` if your request path already blocks. Do not mix the sync client into an async request path.
 
-### Step 3: Wire Acquire Into Your Load Path
+### Step 2: Adapt the template
 
-Inside your service's code, wherever you load a model onto GPU, do this:
+Copy the file into your service as `broker_client.py`. Then:
 
-1. Call `_broker_acquire(mb)` with the VRAM size the model needs, in MB. The function blocks until the broker grants or denies the lease, or the timeout expires.
-2. Check the returned `lease_id`. If it is `None` and `BROKER_FAIL_OPEN` is enabled, proceed with the load. If it is `None` and `BROKER_FAIL_OPEN` is disabled, reject the request (the function raises `HTTPException`).
-3. Store the lease ID (the sync client variant takes it as a parameter to release and heartbeat).
+1. Set `CALLER_NAME` to a unique name such as `"my-inference-service"`.
+2. Set `BROKER_URL` in `.env` (default `http://host.containers.internal:8792`).
+3. Leave `BROKER_FAIL_OPEN` at `false` unless your service can run with no broker.
 
-The acquire call must complete before the load actually places data on GPU.
+Use a fixed caller string if the service has one load slot.
 
-### Step 4: Wire Release Into Your Evict Path
+### Step 3: Wire acquire, heartbeat, and release
 
-Wherever you remove a model from GPU and free VRAM, do this:
+Acquire must finish before the load writes VRAM. Release must run after you free VRAM. Store `lease_id` in your own state.
 
-1. Call the VRAM-freeing operation (for example, `torch.cuda.empty_cache()`).
-2. After that call returns, call `_broker_release()` (async variant) or `_broker_release(lease_id)` (sync variant).
-3. Clear any stored lease ID state.
+```python
+lease_id = None
 
-Call release only after VRAM is actually freed, not merely when eviction is decided.
+async def load_model(mb: int) -> None:
+    global lease_id
+    result = await _broker_acquire(mb)
+    if result is None:
+        # BROKER_FAIL_OPEN: load without a lease
+        load_weights()
+        return
+    lease_id = result.lease_id
+    try:
+        load_weights()
+    except Exception:
+        await _broker_release(lease_id)
+        lease_id = None
+        raise
 
-### Step 5: Wire Heartbeat Into Your Idle Watcher
+async def heartbeat_tick() -> None:
+    global lease_id
+    if lease_id is None:
+        return
+    hb = await _broker_heartbeat(lease_id)
+    if hb.preempt:
+        unload_weights()
+        await _broker_release(lease_id)
+        lease_id = None
+        return
+    if hb.ok is False:
+        await _broker_release(lease_id)
+        result = await _broker_acquire(MB)
+        lease_id = None if result is None else result.lease_id
+        return
+    # hb.ok is True or None: keep going, or retry next tick
 
-If your service runs a periodic idle-watcher or health-check background task, call `_broker_heartbeat()` (async) or `_broker_heartbeat(lease_id)` (sync) on each tick, only when a lease is held.
+async def unload_model() -> None:
+    global lease_id
+    unload_weights()
+    await _broker_release(lease_id)
+    lease_id = None
+```
 
-An acceptable brief blocking call inside an async loop is fine, similar to Needle's own pattern in the existing codebase.
+Drop `await` for the sync client. Map the plain exceptions to HTTP in your service. See FastAPI mapping below.
 
-### Step 6: Set Environment Variables
-
-Add these to your `.env` or container environment:
+### Step 4: Environment variables
 
 ```
 BROKER_URL=http://host.containers.internal:8792
-BROKER_FAIL_OPEN=true  # or false, depending on your decision (see below)
+BROKER_FAIL_OPEN=false
 ```
 
-### Step 7: Verify Integration
+### Step 5: Verify
 
-Once wired, verify the integration:
+1. Start your service and trigger a load.
+2. Call `curl http://broker:8792/status`.
+3. Confirm your caller name appears under `leases`.
+4. Trigger an evict. Confirm the lease is gone from `/status`.
 
-1. Start your service and trigger a load operation.
-2. Query the broker's `/status` endpoint while your service is loading: `curl http://broker:8792/status`.
-3. In the response, find the `leases` object. Confirm your caller name shows up with a lease entry.
-4. Trigger an evict operation. Query `/status` again and confirm the lease entry has disappeared.
-
-## Broker API Endpoints
-
-The broker exposes three endpoints for acquire, release, and heartbeat.
+## Broker API endpoints
 
 ### POST /acquire
 
 Request:
+
 ```json
-{
-  "caller": "my-service",
-  "mb": 5120,
-  "timeout_s": 30.0
-}
+{"caller": "my-service", "mb": 5120, "timeout_s": 30.0}
 ```
 
-Response on grant (HTTP 200):
-```json
-{
-  "granted": true,
-  "lease_id": "abc123"
-}
-```
+| Status | Body / header | Client result |
+|---|---|---|
+| 200 | `{granted, lease_id, warning?}` | `AcquireResult` |
+| 504 | `Retry-After` (broker sends 10) | `BrokerNoRoom` |
+| 503 | `detail` is `unmanaged_gpu_load` or `too_many_leases`, plus `Retry-After` | `BrokerBusy` |
+| 422 or 400 | invalid input, size that can never fit, or bad priority | `BrokerRejected` |
 
-Response on denial (HTTP 504): The broker blocks internally up to `timeout_s` and returns HTTP 504 if never admitted. Treat 504 as a permanent denial and reject the request immediately. Do not retry.
+The broker already waited up to `timeout_s` before a 504. The template does not retry 504, 503, 422, or 400. Your service may retry 504 later. The broker keeps wait age for 120 seconds after a 504.
 
 ### POST /release
 
-Request:
-```json
-{
-  "lease_id": "abc123"
-}
-```
-
-Response (HTTP 200):
-```json
-{
-  "released": bool
-}
-```
-
-The endpoint always returns 200, even for an unknown lease ID. The operation is idempotent.
+Request: `{"lease_id": "abc123"}`. Response: `{released: bool}`. Always HTTP 200. Idempotent.
 
 ### POST /heartbeat
 
-Request:
-```json
-{
-  "lease_id": "abc123"
-}
+Request: `{"lease_id": "abc123"}`. Response is `{ok: false}` for an unknown lease. A live lease returns `{ok: true, preempt: bool, reason: str}`. Always HTTP 200.
+
+## BROKER_FAIL_OPEN
+
+Default is `false` (fail closed) in both templates.
+
+A tightly-integrated service that loads weights without a lease can OOM the GPU and take down other holders. Fail closed unless your service has a fallback that does not need the GPU.
+
+`BROKER_FAIL_OPEN` applies only after transport retries fail (connect, timeout, and similar). It does not apply to 504, 503, 422, or 400. Those are explicit broker answers. A 503 `unmanaged_gpu_load` during a game must not load weights.
+
+Set `true` only when a missing broker should not fail the service. Flux2Klein9B uses `true` because it can still generate, with OOM risk on collision. Needle uses `false` because uncoordinated inference can crash the runtime.
+
+## Names the templates export
+
+- `BROKER_URL`, `BROKER_FAIL_OPEN`, `CALLER_NAME`
+- `AcquireResult`, `HeartbeatResult`
+- `BrokerNoRoom`, `BrokerBusy`, `BrokerRejected`, `BrokerUnavailable`
+- `_broker_acquire(mb) -> AcquireResult | None`
+- `_broker_release(lease_id) -> None`
+- `_broker_heartbeat(lease_id) -> HeartbeatResult`
+
+Each call opens an `httpx` client in a context manager and closes it before return.
+
+Retry on transport errors: 5 attempts, backoff 0.5 s, then double, cap 5 s. Explicit denials do not retry.
+
+## FastAPI mapping
+
+The templates raise plain exceptions so they work outside FastAPI. A FastAPI service can map them like this:
+
+```python
+from fastapi import HTTPException
+
+def raise_http(exc: BrokerError) -> None:
+    if isinstance(exc, BrokerNoRoom):
+        retry = str(int(exc.retry_after or 10))
+        raise HTTPException(
+            status_code=503,
+            detail="GPU memory full",
+            headers={"Retry-After": retry},
+        )
+    if isinstance(exc, BrokerBusy):
+        retry = str(int(exc.retry_after or 5))
+        raise HTTPException(
+            status_code=503,
+            detail=exc.detail,
+            headers={"Retry-After": retry},
+        )
+    if isinstance(exc, BrokerRejected):
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    raise HTTPException(status_code=503, detail="broker unreachable")
 ```
 
-Response (HTTP 200):
-```json
-{
-  "ok": bool
-}
-```
+## Error handling
 
-The endpoint always returns 200. A lease that receives no heartbeat for longer than the broker's lease TTL (default 180 seconds) is reclaimed by the broker's background sweeper.
+- `_broker_acquire` raises `BrokerNoRoom`, `BrokerBusy`, `BrokerRejected`, or `BrokerUnavailable`. It returns `None` only when `BROKER_FAIL_OPEN` is true and the last transport retry fails.
+- `_broker_release` never raises. It logs a warning and continues.
+- `_broker_heartbeat` never raises. Read `ok` and `preempt` on every tick.
 
-## Choosing BROKER_FAIL_OPEN
+## Reference implementations
 
-The `BROKER_FAIL_OPEN` environment variable controls what happens if the broker is unreachable or denies a lease.
-
-Set `BROKER_FAIL_OPEN=true` if your service has a safe fallback when the broker is unavailable. For example, Flux2Klein9B sets this to `true` because it can still generate images without broker coordination, risking OOM only if resources collide with other services. A missing broker is an availability reduction but not a service failure.
-
-Set `BROKER_FAIL_OPEN=false` if your service must reject requests it cannot coordinate with the broker. For example, Needle sets this to `false` because uncoordinated inference risks crashing the entire runtime. A missing broker is a service failure, not a graceful degradation.
-
-This is a deliberate per-service decision, not a universal default that applies to all services. Document your choice in your own README.
-
-## What Each Client Template Provides
-
-Both templates provide the same three functions and globals:
-
-- `BROKER_URL`, `BROKER_FAIL_OPEN`, `CALLER_NAME` (module-level globals you edit)
-- `lease_id` (module-level state for the async variant). The sync variant takes it as a parameter.
-- `_broker_acquire(mb: int)` returns `str | None`
-- `_broker_release()` (async) or `_broker_release(lease_id: str | None)` (sync), returns `None`
-- `_broker_heartbeat()` (async) or `_broker_heartbeat(lease_id: str | None)` (sync), returns `None`
-
-The async and sync variants use identical retry logic and backoff timings. The async variant uses `httpx.AsyncClient` and `asyncio.sleep`, while the sync variant uses `httpx.Client` and `time.sleep`.
-
-## Error Handling
-
-All three functions log their outcomes but handle retries internally.
-
-- `_broker_acquire()` raises `HTTPException(503, ...)` on broker denial or unrecoverable error (unless `BROKER_FAIL_OPEN=true`).
-- `_broker_release()` and `_broker_heartbeat()` never raise. They log warnings and continue.
-
-Every exception is logged at the appropriate level (info, warning, or error) before the function returns or raises.
-
-## Notes on the Reference Implementations
-
-Flux2Klein9B (async) defaults `BROKER_FAIL_OPEN=true` and uses async httpx for non-blocking I/O.
-
-Needle (sync) defaults `BROKER_FAIL_OPEN=false` and uses sync httpx because its own request handler blocks during inference anyway.
-
-Both are production integrations. Study both if you are unsure which pattern fits your service.
+Flux2Klein9B is async and sets `BROKER_FAIL_OPEN=true`. Needle is sync and sets `BROKER_FAIL_OPEN=false`. Both are production integrations. Study both if the choice is unclear.

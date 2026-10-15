@@ -90,12 +90,17 @@ generation (`classify()`), so use a **synchronous `httpx.Client`** here, not asy
 
 ## Design reference (already implemented in `server.py`)
 
-- **Admission formula**: admit `requested_mb` iff
+- **Admission formula** (superseded live-usage gate): an earlier draft
+  admitted `requested_mb` iff
   `max(nvidia_smi_used_mb, reserved_mb + ollama_mb) + requested_mb <= BUDGET_MB`.
-  `nvidia_smi_used_mb` is a live subprocess call at check time (never cached — this is
-  what keeps the check safe even if the Ollama poll is stale, or right after a broker
-  restart). `reserved_mb` is the broker's own ledger (authoritative, no TOCTOU).
-  `max`, not sum, avoids double-counting a partially-loaded client's own usage.
+  That formula is not in `server.py`. Live usage only feeds a log warning
+  from the poller cache.
+  Current gate: `reserved_mb + ollama_mb + requested_mb <= budget_mb`,
+  where `budget_mb = gpu_total_mb - _safety_margin_mb()`.
+  `_safety_margin_mb()` is the larger of the p95 of unlocked non-lease
+  samples (or `GPU_SAFETY_MARGIN_MB` as fallback) and
+  `GPU_SAFETY_MARGIN_MIN_MB`.
+  `reserved_mb` is the broker ledger.
 - **Idempotency**: dedup key is the caller's own name (not a generated UUID) — both
   clients only ever have one load attempt in flight at a time already, guarded by
   their own existing lock.

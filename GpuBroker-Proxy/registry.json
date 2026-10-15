@@ -1,6 +1,18 @@
 {
   "backends": [
     {
+      "name": "talkie",
+      "base_url": "http://host.containers.internal:8101",
+      "models": ["talkie-1930-13b"],
+      "default": false
+    },
+    {
+      "name": "freetoken",
+      "base_url": "http://host.containers.internal:1919",
+      "models": ["ornith-1.5-35b-a3b"],
+      "default": false
+    },
+    {
       "name": "ollama",
       "base_url": "http://ollama:11434",
       "models": [],

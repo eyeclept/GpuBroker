@@ -1,7 +1,27 @@
-The admission gate in server.py now uses only ledger-based projections to decide requests. The formula is reserved_mb plus ollama_mb plus requested_mb must be less than or equal to gpu_total minus SAFETY_MARGIN_MB. This change fixes a bug that double-counted idle VRAM as both live usage and the configured margin.
+The public changelog documents user-facing code changes. It excludes internal development process, security-audit bookkeeping, and documentation-only commits.
 
-Live GPU usage is still read on every admission attempt, but it now serves only anomaly detection. A warning log flags unexpected spikes versus the sum of SAFETY_MARGIN_MB and reserved_total. The docstring at server.py line 306 was updated to document this new formula and rationale. No changes are needed in .env, .env.example, or plan.md.
+The broker now validates `/acquire` requests. `mb` must be finite and non-negative. `timeout_s` must be finite and within `[0, 600]`. `pid` must be positive. Requests that cannot fit after accounting for the safety margin and live reservations are rejected with 422.
 
-Two regression tests were added in tests/test_server.py to reproduce the original incident numbers. One test uses gpu_total of 12282 and a margin of 4864. A request for 5120 MB was previously rejected even though about 9060 MB was physically free. The fix now grants this request, so one test confirms that behavior. Another test confirms an 11000 MB request still times out.
+A 64-lease cap returns 503 too_many_leases once exceeded. Same-caller duplicate acquires are resolved so concurrent requests share a single lease.
 
-The existing test_queue_timeout_when_no_room was adjusted because it relied on live usage alone to trigger the old gate refusal. Its request size changed from 1000 to 7000 MB. A Resolved addendum was appended to Assist/ISSUE_double_counted_margin.md to document this fix and its scope deviation. The original issue doc noted not to touch the max() term, but that term is now repurposed for anomaly detection rather than gate input. Live broker verification against a real running instance confirms the change.
+The watchdog sweep now logs and skips per-lease classification and reclamation errors. It lets one malformed lease stop all reclaims no longer stalls the process.
+
+Waiting acquires wake on admission-state changes via an asyncio event. This grants leases within milliseconds of release rather than up to 10 seconds later.
+
+`nvidia-smi` reads are cached. The broker moves them outside the broker lock. A hung or missing tool no longer blocks acquire or status. It renders as n/a on the dashboard.
+
+Steam Proton detection reads process data as bytes. It skips per-pid errors. It ignores wrappers owned by a uid other than the broker's. Leases now carry preempt reasons surfaced in heartbeat responses.
+
+Persistence is hardened with atomic, 0600 temp-file writes and tolerated-shape restore. Sample files persist every 10 samples (or on shutdown) instead of every 30 seconds. This cuts daily writes roughly ten-fold.
+
+The GpuBroker-Proxy and FreeToken enforce 64 MiB request-body caps with 413 responses. They release leases when the client disconnects. They keep streams finishing on failure.
+
+FreeToken exposes a unified lease contract across its sync and async clients. It uses explicit result and error types and fail-closed defaults. Example clients handle 503/504/422, preemption, and cleanup on exit.
+
+Retired LlamaSwap code was removed. `/admin/clear` behavior is documented as killing every GPU compute process except the broker.
+
+The broker enforces a trusted-Host allowlist. It uses tri-state post-kill verification. The watchdog signals only uniquely resolved container GPU processes.
+
+Base images are pinned by digest with hashed pip dependencies. Broker FastAPI docs are disabled.
+
+The dashboard avoids per-poll history re-reads. Test coverage was substantially expanded.

@@ -5,48 +5,50 @@ Email:  eyeclept@pm.me
 
 Description:
 
-GpuBroker-Proxy: a stateless reverse proxy speaking Ollama's full API
-surface -- both its native /api/* endpoints and the OpenAI-compatible
-/v1/* subset -- routing requests to a configured model -> upstream-backend
-registry and gating real generation work through GpuBroker's existing
-/acquire and /release endpoints before forwarding.
+GpuBroker-Proxy: a stateless reverse proxy for Ollama's full API
+(native /api/* and OpenAI-compatible /v1/*). It routes each request
+to a backend from registry.json and gates generation work through
+GpuBroker /acquire and /release before it forwards.
 
-Traffic light, not editor: this proxy never mutates request or response
-bodies. It peeks at the "model" field of a JSON request body only to pick a
-backend, then forwards the original bytes verbatim (including streaming
-responses) to that backend and streams the reply straight back.
+This proxy does not edit request or response bodies. It peeks at the
+JSON "model" field only to pick a backend. It then forwards the original
+bytes, including streaming responses.
 
-Ollama is the only registered backend today (see registry.json), reached at
-http://ollama:11434 over the ollama_default podman network -- Ollama's own
-docker-compose.yml no longer publishes that port to the host, so this proxy
-is the only path to it. A future OpenAI-compatible backend (e.g. a
-Whisper/audio service) is added purely as a new registry.json entry; no
-proxy code changes.
+registry.json currently lists Talkie (model talkie-1930-13b), FreeToken
+(model ornith-1.5-35b-a3b), and Ollama (default, empty models list).
+Ollama is reached at http://ollama:11434 on the ollama_default podman
+network. Ollama no longer publishes that port to the host, so this
+proxy is the host path to it. A new OpenAI-compatible backend is a new
+registry.json entry. No proxy code change is required.
 
-Admission accounting: every proxied request calls GpuBroker's /acquire with
-mb=0, never a real size estimate. Ollama's actual VRAM footprint is already
-tracked passively by the broker itself via its own /api/ps poll (_ollama_mb
-in server.py) -- charging mb here too would double-count against the shared
-budget. The mb=0 acquire call exists purely to give each proxied request a
-lease and a turn in the broker's fairness queue, so a burst of Ollama/OAIE
-traffic queues behind Flux2Klein9B/Needle's real VRAM holds under contention
-instead of firing blind into an already-saturated GPU. There is no
-pre-load size estimate to gate on regardless -- confirmed live, Ollama's
-/api/ps only reports size_vram after a model finishes loading.
+Admission accounting: every gated request calls /acquire with mb=0.
+Ollama VRAM is already tracked by the broker via /api/ps (_ollama_mb).
+Charging a size here would double-count. The mb=0 acquire gives each
+gated request a lease. The broker does not queue mb=0 acquires in its
+FIFO, so a large waiter that cannot fit does not block them. They still
+wait while the ledger is over budget and are refused while a game is
+running.
+There is no pre-load size to gate on. Ollama /api/ps reports size_vram
+only after a model finishes loading.
 
-Admission signaling: on denial (broker's /acquire itself times out waiting
-for room) this proxy returns HTTP 429 with a Retry-After header, matching
-the OpenAI API's own rate-limit convention and relying on OAIE SDKs' builtin
-429/Retry-After retry logic. On broker-unreachable (connection failure, not
-a denial) this proxy fails open by default (BROKER_FAIL_OPEN) -- consistent
-with the existing accepted risk that Ollama's footprint has always been
+Admission signaling: on denial this proxy returns HTTP 429 with
+Retry-After. That matches the OpenAI rate-limit convention. Two broker
+responses are denials: 504 (acquire timed out waiting for room) and 503
+(unmanaged GPU load such as a game, or the lease cap; the broker's
+Retry-After is passed through). 503 detail selects the caller message:
+unmanaged_gpu_load, too_many_leases, or a generic refusal. On
+broker-unreachable (connection failure, not a denial) this proxy fails
+open by default (BROKER_FAIL_OPEN). Ollama's footprint has always been
 observed passively, never gated with hard exclusivity.
 
 Endpoints:
-    ANY /{path}   -> proxied to the resolved backend's /{path} (gated
-                     through the broker only when the request declares a
-                     "model"; metadata/management calls pass straight
-                     through unmetered)
+    GET, POST, DELETE /{path} -> proxied to the resolved backend /{path}.
+                     Gated through the broker when the request declares
+                     a "model", except UNGATED_MODEL_PATHS. POST /api/show
+                     is Ollama model metadata and does not load weights,
+                     so it is routed by model but not acquire/release.
+                     Other metadata and management calls with no model
+                     field pass through unmetered.
     GET /health   -> {"status": "ok"}
 """
 
@@ -60,6 +62,7 @@ import os
 import uuid
 from typing import AsyncIterator
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -75,12 +78,19 @@ BROKER_FAIL_OPEN = os.environ.get("BROKER_FAIL_OPEN", "true").lower() in ("true"
 BROKER_ACQUIRE_TIMEOUT_S = float(os.environ.get("BROKER_ACQUIRE_TIMEOUT_S", "10.0"))
 PROXY_RETRY_AFTER_SECONDS = float(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "3.0"))
 REGISTRY_PATH = os.environ.get("PROXY_REGISTRY_PATH", "/app/registry.json")
+# One third of the broker lease TTL (180 s).
+PROXY_HEARTBEAT_INTERVAL_S = 60.0
+# Vision requests carry base64 images; 64 MiB is generous.
+MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+# Only endpoints verified not to load weights belong here.
+UNGATED_MODEL_PATHS = {"api/show"}
 
-# Connection-failure retry budget for the broker's own /acquire and /release
-# calls (distinct from GpuBroker's internal admission long-poll, which is
-# bounded by BROKER_ACQUIRE_TIMEOUT_S above). Shorter than Flux2Klein9B's
-# matching constants -- OAIE callers are usually interactive and more
-# latency-sensitive than an occasional model-load acquire.
+
+# Connection-failure retry budget for the proxy's own /acquire and
+# /release calls. Distinct from GpuBroker's internal admission wait,
+# which is bounded by BROKER_ACQUIRE_TIMEOUT_S above. Shorter than
+# Flux2Klein9B's matching constants. OAIE callers are interactive and
+# more latency-sensitive than an occasional model-load acquire.
 _ACQUIRE_MAX_ATTEMPTS = 3
 _ACQUIRE_BACKOFF_MIN_S = 0.5
 _ACQUIRE_BACKOFF_MAX_S = 2.0
@@ -126,12 +136,10 @@ def _resolve_backend(model: str | None) -> dict | None:
     Input:      model - the "model" field from the request body, or None
     Output:     dict - the matching backend entry, or None if none resolves
     Details:
-        Exact-match model against each backend's declared "models" list
-        first; falls back to whichever backend is flagged "default": true.
-        With today's single-backend registry (Ollama, flagged default, empty
-        models list) every request resolves to it regardless of the model
-        name -- this generalizes cleanly once a second, model-specific
-        backend is registered.
+        Exact-match model against each backend's "models" list first.
+        Falls back to the backend flagged "default": true. Talkie matches
+        talkie-1930-13b. Unmatched models, including Ollama names, fall
+        through to Ollama (default, empty models list).
     """
     if model is not None:
         for backend in _registry:
@@ -148,12 +156,12 @@ def _extract_model(body: bytes) -> str | None:
     Input:      body - raw request body bytes
     Output:     str | None - the "model" field if present and a string
     Details:
-        Empty bodies (e.g. GET /v1/models) are not an error -- short-circuit
-        before attempting to parse. Non-empty bodies that fail to parse as
-        JSON (e.g. a multipart /v1/audio/transcriptions upload -- not
-        supported by any backend registered today) are logged and treated
-        as model=None, which falls through to the registry's default
-        backend rather than failing the request outright.
+        Empty bodies (for example GET /v1/models) are not an error.
+        Skip parse. Non-empty bodies that fail as JSON (for example a
+        multipart /v1/audio/transcriptions upload, not supported by any
+        registered backend today) are logged and treated as model=None.
+        That falls through to the registry default instead of failing
+        the request.
     """
     if not body:
         return None
@@ -187,9 +195,13 @@ async def _broker_acquire(caller: str) -> str | None:
     Input:      caller - unique per-request caller name for this lease
     Output:     str | None - lease_id if acquired, None if fail-open (no lease)
     Details:
-        Calls GpuBroker's /acquire with mb=0 (see module docstring for why).
-        On denial (broker's own long-poll timed out, no GPU room) raises
-        HTTPException(429) with a Retry-After header -- caller should retry.
+        Calls GpuBroker /acquire with mb=0 (see module docstring).
+        On denial (broker long-poll timed out, no GPU room) raises
+        HTTPException(429) with Retry-After. The caller should retry.
+        On broker 503 also raises HTTPException(429), with the broker's
+        Retry-After when present. 503 detail unmanaged_gpu_load,
+        too_many_leases, or anything else each get a distinct caller
+        message. A 503 is a denial, never a reason to fail open.
         On connection failure: retries with backoff, then fails open
         (returns None) or closed (raises 503) per BROKER_FAIL_OPEN.
     """
@@ -208,7 +220,31 @@ async def _broker_acquire(caller: str) -> str | None:
                 raise HTTPException(
                     status_code=429,
                     detail="GPU busy, retry later",
-                    headers={"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)},
+                    headers={"Retry-After": resp.headers.get("Retry-After") or str(PROXY_RETRY_AFTER_SECONDS)},
+                )
+            if resp.status_code == 503:
+                retry_after = resp.headers.get("Retry-After") or str(PROXY_RETRY_AFTER_SECONDS)
+                detail = None
+                try:
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        detail = payload.get("detail")
+                except ValueError:
+                    logger.warning("broker 503 body was not JSON for caller=%s", caller)
+                if detail == "unmanaged_gpu_load":
+                    message = "GPU reserved for unmanaged load, retry later"
+                elif detail == "too_many_leases":
+                    message = "broker lease limit reached, retry later"
+                else:
+                    message = "GPU broker refused admission, retry later"
+                logger.warning(
+                    "broker refused admission (detail=%s) for caller=%s, retry_after=%s",
+                    detail, caller, retry_after,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=message,
+                    headers={"Retry-After": retry_after},
                 )
             resp.raise_for_status()
             lease_id = resp.json().get("lease_id")
@@ -233,7 +269,7 @@ async def _broker_acquire(caller: str) -> str | None:
                 logger.warning("broker error, failing open (unmetered)")
                 return None
             raise HTTPException(status_code=502, detail="broker error")
-    # Should not reach here -- loop always returns or raises.
+    # Should not reach here. The loop always returns or raises.
     logger.warning("broker acquire: unexpected end of retry loop for caller=%s", caller)
     if BROKER_FAIL_OPEN:
         return None
@@ -246,9 +282,9 @@ async def _broker_release(lease_id: str | None, caller: str) -> None:
                 caller - caller name, for logging only
     Output:     None
     Details:
-        Best-effort release. Logs and continues on failure -- GpuBroker's own
-        sweeper reclaims an un-released lease after LEASE_TTL_SECONDS, so a
-        failed release here is not a permanent leak.
+        Best-effort release. Logs and continues on failure. GpuBroker's
+        sweeper reclaims an un-released lease after LEASE_TTL_SECONDS, so
+        a failed release here is not a permanent leak.
     """
     if lease_id is None:
         return
@@ -262,6 +298,71 @@ async def _broker_release(lease_id: str | None, caller: str) -> None:
         logger.warning("broker release failed for lease=%s caller=%s (continuing)", lease_id, caller)
 
 
+async def _read_bounded_body(request: Request) -> bytes:
+    """
+    Input:      request - the incoming HTTP request
+    Output:     bytes - the full request body, at most MAX_REQUEST_BODY_BYTES
+    Details:
+        Rejects with 413 when Content-Length exceeds the cap, without
+        reading the body. Also counts bytes from request.stream() so a
+        chunked body without Content-Length is bounded too.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            logger.warning("invalid Content-Length header: %s", content_length)
+        else:
+            if declared > MAX_REQUEST_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="request body too large")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="request body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _heartbeat_loop(lease_id: str, caller: str) -> None:
+    """
+    Input:      lease_id - live zero-size lease to keep alive
+                caller - caller name, for logging only
+    Output:     None
+    Details:
+        POST /heartbeat every PROXY_HEARTBEAT_INTERVAL_S while a leased
+        response streams. A heartbeat HTTP failure logs a warning and
+        keeps the loop running. Ignore preempt: a zero-size lease holds
+        no VRAM. If the broker answers ok: false, log a warning once
+        and stop heartbeating.
+    """
+    while True:
+        await asyncio.sleep(PROXY_HEARTBEAT_INTERVAL_S)
+        try:
+            resp = await _broker_client.post(
+                f"{BROKER_URL}/heartbeat",
+                json={"lease_id": lease_id},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.warning(
+                "broker heartbeat failed for lease=%s caller=%s (continuing)",
+                lease_id, caller,
+            )
+            continue
+        if not data.get("ok", False):
+            logger.warning(
+                "broker heartbeat returned ok=false for lease=%s caller=%s; stopping heartbeats",
+                lease_id, caller,
+            )
+            return
+        # Ignore preempt: zero-size lease, holds no VRAM.
+
+
 async def _stream_backend_response(
     resp: httpx.Response, lease_id: str | None, caller: str,
 ) -> AsyncIterator[bytes]:
@@ -272,15 +373,39 @@ async def _stream_backend_response(
     Details:
         Releases the broker lease only after the full response has drained
         (success) or the generator is torn down early (client disconnect,
-        backend error mid-stream) -- never right after headers, since the
-        backend may still be resident/generating for the whole stream.
+        backend error mid-stream). Never right after headers. The backend
+        may still be resident and generating for the whole stream.
+        While the stream is open, a background task heartbeats the lease.
+        The heartbeat is cancelled before release. resp.aclose() failure
+        is logged and does not skip release.
+        Starlette cancels this generator in an anyio cancel scope on
+        http.disconnect. Shield cleanup so gather, aclose, and release
+        still finish; CancelledError still propagates after this block.
     """
+    hb_task = None
+    if lease_id is not None:
+        hb_task = asyncio.create_task(_heartbeat_loop(lease_id, caller))
     try:
         async for chunk in resp.aiter_bytes():
             yield chunk
     finally:
-        await resp.aclose()
-        await _broker_release(lease_id, caller)
+        # Shield, not a detached create_task: cleanup stays in this
+        # generator so release still runs exactly once and callers
+        # observe it before the ASGI request returns. anyio is already
+        # a Starlette dependency. Use sync `with` so the shield is
+        # armed before any await (async with would checkpoint first).
+        with anyio.CancelScope(shield=True):
+            try:
+                if hb_task is not None:
+                    hb_task.cancel()
+                    await asyncio.gather(hb_task, return_exceptions=True)
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    logger.warning("upstream response close failed for caller=%s", caller)
+                finally:
+                    await _broker_release(lease_id, caller)
 
 
 async def proxy_any(path: str, request: Request):
@@ -289,26 +414,17 @@ async def proxy_any(path: str, request: Request):
                 request - the incoming HTTP request
     Output:     StreamingResponse - the backend's response, forwarded verbatim
     Details:
-        Forwards ANY path (not just /v1/*) to the resolved backend --
-        confirmed live that Headroom's headroom-ollama calls Ollama's native
-        GET /api/ps directly, not just the OpenAI-compatible /v1/* surface,
-        so restricting routing to /v1/* silently 404s existing consumers.
-        "Identical behavior to before the reroute, no config change needed"
-        (Phase 5's own Step 5 contract) requires forwarding the full
-        namespace Ollama itself answered on port 11434.
+        Forwards GET, POST, and DELETE paths to the resolved backend, not
+        only /v1/*. Headroom's headroom-ollama calls Ollama GET /api/ps
+        directly. Restricting routing to /v1/* would 404 those callers.
 
-        Admission-gates (broker acquire/release) only requests that declare
-        a "model" in the body -- the signal that this is real generation
-        work, not a metadata/management call (GET /api/ps, /api/tags,
-        /v1/models etc. never carry a model field and so pass straight
-        through unmetered, exactly as Ollama itself behaved for those calls
-        before this proxy existed). Known imperfection: a handful of
-        Ollama's own metadata endpoints (e.g. POST /api/show) do include a
-        "model" field despite not consuming GPU generation resources, and so
-        get gated too -- accepted as a minor, non-breaking inefficiency
-        rather than hardcoding a full per-endpoint classification table.
+        Admission-gates requests that declare a "model" in the body,
+        except UNGATED_MODEL_PATHS. POST /api/show includes a model field
+        but does not load weights, so it is routed by model and skipped
+        for acquire/release. GET /api/ps, /api/tags, and /v1/models have
+        no model field, so they pass through unmetered.
     """
-    body = await request.body()
+    body = await _read_bounded_body(request)
     model = _extract_model(body)
     backend = _resolve_backend(model)
     if backend is None:
@@ -317,7 +433,7 @@ async def proxy_any(path: str, request: Request):
 
     lease_id = None
     caller = f"oaie-proxy:{backend['name']}:{uuid.uuid4().hex}"
-    if model is not None:
+    if model is not None and path not in UNGATED_MODEL_PATHS:
         lease_id = await _broker_acquire(caller)
 
     upstream_url = f"{backend['base_url']}/{path}"
@@ -354,6 +470,16 @@ async def health():
     return {"status": "ok"}
 
 
+async def _disabled_docs():
+    """
+    Input:      None
+    Output:     never returns
+    Details:    FastAPI docs are disabled. Explicit 404 so the catch-all
+                proxy route does not forward /docs or /openapi.json.
+    """
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
 # Wire up endpoints and startup via lifespan
 
 @asynccontextmanager
@@ -363,10 +489,9 @@ async def lifespan(app_ctx: FastAPI):
     Output:     None (async context manager)
     Details:
         Startup: loads the backend registry and opens one shared httpx
-        client reused across every proxied request and broker call (a
-        proxy forwards sustained/streaming traffic, unlike GpuBroker's
-        clients which only make occasional short round-trips -- a
-        persistent client avoids reconnecting per request).
+        client reused across every proxied request and broker call.
+        A proxy forwards sustained streaming traffic. A persistent
+        client avoids reconnecting per request.
         Shutdown: closes the shared client.
     """
     global _broker_client, _registry
@@ -377,8 +502,11 @@ async def lifespan(app_ctx: FastAPI):
     await _broker_client.aclose()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_api_route("/health", health, methods=["GET"])
+app.add_api_route("/docs", _disabled_docs, methods=["GET"])
+app.add_api_route("/redoc", _disabled_docs, methods=["GET"])
+app.add_api_route("/openapi.json", _disabled_docs, methods=["GET"])
 app.add_api_route("/{path:path}", proxy_any, methods=["GET", "POST", "DELETE"])
 
 

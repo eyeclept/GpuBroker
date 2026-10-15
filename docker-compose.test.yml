@@ -1,0 +1,58 @@
+# Second GpuBroker instance for testing the dashboard TUI (tools/dashboard.py,
+# see Assist/TODO.md section 8) without ever touching the live
+# gpubroker-gpubroker-1 container, which is serving real Flux2Klein9B/Needle/
+# Ollama-proxy traffic. Differences from docker-compose.yml, each existing to
+# keep this instance fully isolated from the real GPU and the real broker:
+#
+#   - `name:` below scopes this to its own compose project (gpubroker-test),
+#     so its container/image/network names never collide with the live
+#     project's gpubroker-gpubroker-1.
+#   - No `devices: [nvidia.com/gpu=all]` -- this instance must never touch
+#     the real GPU. Without a real nvidia-smi in the container, server.py's
+#     startup() would fail closed (see _nvidia_smi_query), so the
+#     tools/mock_nvidia_smi.sh bind mount below stands in for it. This is
+#     the same "mock the nvidia-smi/ollama calls" pattern
+#     tests/test_server.py already uses for admission-formula tests, applied
+#     at the container boundary instead of via unittest.mock.
+#   - No `pid: host` -- this instance's /admin/clear stays disabled anyway
+#     (GPU_BROKER_ADMIN_TOKEN unset in .env.test), so it has no need to see
+#     real host PIDs.
+#   - Own bind-mounted ledger directory (./data-test) and own published port
+#     (8798 externally, still 8792 inside the container) so both instances
+#     can run at once. 8793 (this section's original TODO example) turned
+#     out to already be bound by an unrelated host process (Colibri's
+#     gate.py) on this workstation -- 8798 is the first genuinely free port
+#     found by checking `ss -ltn` against every port already in use.
+#   - Not joined to the ollama_default network. OLLAMA_URL then resolves
+#     nowhere from inside this container; _poll_ollama's existing
+#     try/except holds ollama_mb at 0.0. That is expected degraded
+#     behavior for an isolated test instance, not a bug.
+#
+# Usage:
+#   cp .env.test.example .env.test   # first time only
+#   podman compose -f docker-compose.test.yml up --build
+#   python3 tools/dashboard.py --url http://localhost:8798 \
+#       --log-path data/dashboard_history_test.jsonl
+#   podman compose -f docker-compose.test.yml down
+
+name: gpubroker-test
+
+services:
+  gpubroker-test:
+    build: .
+    ports:
+      - "8798:8792"
+    env_file:
+      - .env.test
+    volumes:
+      - ./data-test:/data
+      - ./tools/mock_nvidia_smi.sh:/usr/local/bin/nvidia-smi:ro
+    security_opt:
+      - label=disable
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:8792/health', timeout=5.0).raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

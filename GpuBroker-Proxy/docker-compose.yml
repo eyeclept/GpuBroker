@@ -2,11 +2,11 @@ services:
   gpubroker-proxy:
     build: .
     ports:
-      # NOT 127.0.0.1-only: this takes over port 11434 from Ollama itself
+      # Not 127.0.0.1-only. This takes over port 11434 from Ollama
       # (see ~/Documents/Code/Docker/Ollama/docker-compose.yml, which no
-      # longer publishes it) and must stay reachable from every existing
-      # consumer of that port -- Headroom's headroom-ollama service and any
-      # other host/container caller -- exactly as Ollama itself was.
+      # longer publishes it). It must stay reachable from every existing
+      # consumer of that port, including Headroom's headroom-ollama
+      # service, the same way Ollama itself was.
       - "0.0.0.0:11434:11434"
     env_file:
       - .env
@@ -22,8 +22,8 @@ services:
       start_period: 10s
 
 networks:
-  # Ollama's own compose project's default network -- joined externally so
-  # this proxy can reach Ollama by its service name (http://ollama:11434)
-  # even though Ollama no longer publishes that port to the host.
+  # Ollama's compose default network, joined externally so this proxy
+  # can reach Ollama at http://ollama:11434 even though Ollama no
+  # longer publishes that port to the host.
   ollama_default:
     external: true

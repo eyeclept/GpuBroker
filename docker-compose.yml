@@ -2,14 +2,11 @@ services:
   gpubroker:
     build: .
     ports:
-      # NOT 127.0.0.1-only: this service must be reachable from
-      # Flux2Klein9B/Needle containers via host.containers.internal, which
-      # resolves to the host's bridge gateway IP, not loopback. A
-      # loopback-only bind (mirrored from Flux2Klein9B's own compose file,
-      # which is correct for that service since only the host itself calls
-      # it) makes the broker invisible to every other container on this
-      # host -- confirmed live: clients got "broker unreachable" on every
-      # acquire attempt with this bound to 127.0.0.1 only.
+      # Not 127.0.0.1-only. Flux2Klein9B and Needle containers reach this
+      # service via host.containers.internal, which is the host bridge
+      # gateway IP, not loopback. A loopback-only bind hides the broker
+      # from every other container. Confirmed live: clients got
+      # "broker unreachable" on every acquire when this was 127.0.0.1.
       - "8792:8792"
     env_file:
       - .env
@@ -17,15 +14,33 @@ services:
       - nvidia.com/gpu=all
     security_opt:
       - label=disable
+    # Share the host PID namespace so POST /admin/clear can see and
+    # signal real host PIDs, not container-local ones. Rootless podman
+    # remaps container root to the launching desktop user, so this can
+    # only kill processes owned by that user. That covers every GPU
+    # consumer on this single-user host. No other endpoint reads PIDs.
+    # /admin/clear stays disabled until GPU_BROKER_ADMIN_TOKEN is set
+    # (see .env.example). Without this, nvidia-smi compute-apps PIDs
+    # exist only in the container PID namespace, where the real GPU
+    # consumers do not live. Confirmed live: nvidia-smi inside the
+    # container reported correct memory.used but "No running processes
+    # found" before this was added.
+    pid: host
     volumes:
       - ./data:/data
+      # System bus for login1 Session.LockedHint (see server.py
+      # _read_lock_state). systemd 258 does not write LOCKED_HINT into
+      # /run/systemd/sessions/<id>, so the session-file path cannot
+      # see lock state on this host. Socket is world-accessible
+      # (srw-rw-rw-). Not :ro: dbus clients must send on the socket.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+
     networks:
-      # Reaches Ollama directly for its own passive /api/ps footprint poll
-      # (see server.py's _poll_ollama / OLLAMA_URL) -- this is read-only
-      # telemetry, never meant to be admission-gated, so it bypasses
-      # GpuBroker-Proxy (which now owns port 11434 on the host) rather than
-      # going through it. See GpuBroker-Proxy/docker-compose.yml for the
-      # matching external-network join on the other side.
+      # Reach Ollama directly for the passive /api/ps footprint poll
+      # (see server.py _poll_ollama / OLLAMA_URL). This is read-only
+      # telemetry, not admission-gated, so it bypasses GpuBroker-Proxy
+      # (which now owns host port 11434). See GpuBroker-Proxy/docker-compose.yml
+      # for the matching external-network join.
       - default
       - ollama_default
     restart: unless-stopped

@@ -1,0 +1,42 @@
+services:
+  freetoken:
+    build: .
+    ports:
+      # NOT loopback-only (unlike Flux2Klein9B at 127.0.0.1:8790): the only
+      # consumer, GpuBroker-Proxy, reaches this service via
+      # http://host.containers.internal:1919 -- the same host-gateway path
+      # Talkie uses at :8101 -- and that path cannot connect to a port bound
+      # to 127.0.0.1 (verified: proxy returned "upstream backend
+      # unreachable" with a 127.0.0.1 binding). The proxy is the gatekeeper;
+      # direct unmediated LAN traffic to :1919 is not an intended path but
+      # the bind is 0.0.0.0 to match Talkie's working convention.
+      - "0.0.0.0:1919:1919"
+    env_file:
+      - .env
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - label=disable
+    volumes:
+      # Single cache volume, not just .../huggingface: also persists
+      # ft bench bw's per-GPU profile (~/.cache/freetoken/benchbw/) and
+      # JIT-compiled CUDA kernels (install.md) across rebuilds, so a
+      # `--build` for a code change doesn't force a multi-GB re-download
+      # or a kernel recompile.
+      - ./data/cache:/root/.cache
+    restart: unless-stopped
+    # Default stop grace is 10s, which SIGKILLs the container before
+    # serve_wrapper.py finishes its SIGTERM sequence (drain open streams
+    # up to 30s, stop ft serve up to 40s, release the broker lease).
+    # Without this, every `compose stop` with the model loaded leaks a
+    # lease that only the broker's 180s TTL sweeper reclaims.
+    stop_grace_period: 90s
+    # /health is the wrapper's own endpoint: up in seconds, never loads
+    # the model. The model load (up to FREETOKEN_LOAD_TIMEOUT_SECONDS)
+    # happens on the first request, not at start.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:1919/health', timeout=5.0).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
